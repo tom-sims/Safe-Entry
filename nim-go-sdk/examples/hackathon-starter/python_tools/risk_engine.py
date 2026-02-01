@@ -82,6 +82,109 @@ async def fetch_genesis_date(coin_id: str, coingecko_key: str | None) -> str | N
             data = await resp.json()
     return data.get("genesis_date")
 
+from arch import arch_model
+
+
+async def estimate_drift_mean_reversion(token_ticker, btc_ticker="BTC-USD", days=365, theta=0.3):
+    token_data = yf.Ticker(token_ticker).history(period=f"{days}d", interval="1d")
+    btc_data = yf.Ticker(btc_ticker).history(period=f"{days}d", interval="1d")
+    df = token_data["Close"].to_frame("token").join(btc_data["Close"].to_frame("btc"), how="inner").dropna()
+    if len(df) < 100:
+        raise ValueError(f"Insufficient data for {token_ticker}")
+    r_token = np.log(df["token"]).diff().dropna().values
+    r_btc = np.log(df["btc"]).diff().dropna().values
+    n = min(len(r_token), len(r_btc))
+    r_token, r_btc = r_token[-n:], r_btc[-n:]
+    X = sm.add_constant(r_btc)
+    beta_hat = sm.OLS(r_token, X).fit().params[1]
+    long_term_mean = np.mean(r_token)
+    recent_ret = np.mean(r_token[-30:])
+    mean_reversion_component = theta * (long_term_mean - recent_ret)
+    btc_momentum = np.mean(r_btc[-7:])
+    mu_daily = mean_reversion_component + beta_hat * btc_momentum
+    return mu_daily, beta_hat
+
+
+async def estimate_volatility_garch(token_ticker, days=365):
+    data = yf.Ticker(token_ticker).history(period=f"{days}d", interval="1d")
+    if len(data) < 100:
+        raise ValueError(f"Insufficient data for {token_ticker}")
+    returns = np.diff(np.log(data["Close"].values)) * 100
+    model = arch_model(returns, vol='Garch', p=1, q=1, mean='Zero', rescale=False)
+    fitted = model.fit(disp='off')
+    forecast = fitted.forecast(horizon=1)
+    sigma_daily = np.sqrt(forecast.variance.values[-1, 0]) / 100
+    return sigma_daily
+
+
+def calculate_lambda_from_sybil(sybil_score, attack_regime):
+    regime_multipliers = {
+        0: 1.0,
+        1: 4.0
+    }
+    multiplier = regime_multipliers.get(attack_regime, 1.0)
+    lambda_j = 0.02 * multiplier * (1 + sybil_score * 0.5)
+    return lambda_j
+
+
+def monte_carlo_sde(S0, mu, sigma, lambda_j, mu_j, sigma_j, T=7, dt=1, n_sims=1000):
+    n_steps = int(T / dt)
+    S = np.zeros((n_sims, n_steps + 1))
+    S[:, 0] = S0
+    for i in range(1, n_steps + 1):
+        dW = np.random.randn(n_sims) * np.sqrt(dt)
+        dS = mu * S[:, i-1] * dt + sigma * S[:, i-1] * dW
+        n_jumps = np.random.poisson(lambda_j * dt, n_sims)
+        jump_component = np.zeros(n_sims)
+        for sim in range(n_sims):
+            if n_jumps[sim] > 0:
+                for _ in range(n_jumps[sim]):
+                    Y = mu_j + sigma_j * np.random.randn()
+                    jump_component[sim] += (np.exp(Y) - 1)
+        S[:, i] = S[:, i-1] + dS + S[:, i-1] * jump_component
+        S[:, i] = np.maximum(S[:, i], 0.01)
+    return S
+
+
+def calculate_risk_metrics(S, S0, confidence=0.95):
+    terminal_prices = S[:, -1]
+    returns = (terminal_prices - S0) / S0
+    sorted_returns = np.sort(returns)
+    var_index = int((1 - confidence) * len(sorted_returns))
+    return {
+        'var_95': sorted_returns[var_index],
+        'es_95': np.mean(sorted_returns[:var_index]),
+        'mean_return': np.mean(returns),
+        'median_return': np.median(returns),
+        'prob_profit': np.mean(terminal_prices > S0),
+        'mean_final_price': np.mean(terminal_prices),
+        'terminal_prices': terminal_prices
+    }
+
+
+async def run_sde_simulation(
+    token_ticker: str,
+    S0: float,
+    sybil_score: float,
+    attack_regime: int,
+    T: int = 7,
+    n_sims: int = 1000
+) -> dict:
+    mu, beta = await estimate_drift_mean_reversion(token_ticker, days=365, theta=0.3)
+    sigma = await estimate_volatility_garch(token_ticker, days=365)
+    lambda_j = calculate_lambda_from_sybil(sybil_score, attack_regime)
+    mu_j = np.log(1 - sybil_score * 0.5)
+    sigma_j = 0.2 + (0.5 * (1 - sybil_score))
+    S = monte_carlo_sde(S0, mu, sigma, lambda_j, mu_j, sigma_j, T=T, n_sims=n_sims)
+    risk_metrics = calculate_risk_metrics(S, S0)
+    return {
+        'mu': mu,
+        'sigma': sigma,
+        'lambda': lambda_j,
+        'risk_metrics': risk_metrics,
+        'paths': S.tolist()
+    }
+
 async def fetch_token_contract(coin_id: str, coingecko_key: str | None) -> dict | None:
     """Fetch contract address and blockchain info for a token"""
     url = f"{COINGECKO_BASE}/coins/{coin_id}"
@@ -271,4 +374,5 @@ async def calculate_risk(
         "text": "\n".join(lines),
         "sybil_score": sybil_score_raw,  # Return raw score for additional processing
         "attack_regime": attack_regime,
+
     }
