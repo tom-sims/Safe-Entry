@@ -60,3 +60,6 @@ async def get_market_caps_usd(coingecko_ids: list[str], coingecko_key: str | Non
             caps[cid] = row.get("market_cap")
 
     return caps
+
+    return caps
+
